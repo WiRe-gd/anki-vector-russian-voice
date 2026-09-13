@@ -131,6 +131,74 @@ import anki_vector
 with anki_vector.Robot() as r: r.behavior.say_text('test')"
 ```
 
+### 3.1 Proxmox: общий bind-mount вместо копирования (рекомендуется)
+
+Если wire-pod и демон живут в **разных LXC-контейнерах одного Proxmox-хоста**
+(типичная схема: `escapepod` — wire-pod, `Silero` — этот демон), ручное
+копирование `~/.anki_vector` бьётся о баг из раздела выше: wire-pod пишет
+SDK-файлы в `/tmp/.anki_vector/`, который стирается при каждой перезагрузке
+контейнера. После стирания wire-pod переавторизуется у робота и получает
+**новый guid** — а скопированная на хост демона копия остаётся со старым и
+ловит `StatusCode.UNAUTHENTICATED: 401 Failed to authenticate request`.
+Особенно неприятно это после отключения электричества, когда перезагружаются
+сразу оба контейнера.
+
+Решение — не копировать файл, а сделать `/root/.anki_vector` **одной и той же
+директорией на хосте**, примонтированной в оба контейнера. Тогда wire-pod и
+демон всегда видят один и тот же актуальный guid, без всякой синхронизации.
+
+**На хосте Proxmox** (замените `101`/`112` на свои CTID):
+
+```bash
+mkdir -p /srv/vector-sdk
+# перенести туда текущие рабочие файлы (см. раздел 3, откуда их взять)
+chown -R 100000:100000 /srv/vector-sdk   # если контейнеры unprivileged (root=uid 100000 на хосте)
+# chown -R root:root /srv/vector-sdk     # если privileged
+
+pct stop 101
+pct stop 112
+pct set 101 -mp0 /srv/vector-sdk,mp=/root/.anki_vector
+pct set 112 -mp0 /srv/vector-sdk,mp=/root/.anki_vector
+pct start 101
+pct start 112
+```
+
+**Внутри контейнера wire-pod** — wire-pod всё равно хардкодит путь
+`/tmp/.anki_vector`, поэтому подменяем его постоянной символической ссылкой
+на общий mount (systemd-tmpfiles пересоздаёт её при каждой загрузке, так что
+контейнер можно перезагружать сколько угодно):
+
+```bash
+mkdir -p /root/.anki_vector
+rm -rf /tmp/.anki_vector
+cat > /etc/tmpfiles.d/wirepod-sdk.conf <<'EOF'
+d /root/.anki_vector 0755 root root -
+L /tmp/.anki_vector - - - - /root/.anki_vector
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/wirepod-sdk.conf
+systemctl restart wire-pod
+```
+
+Проверка, что оба контейнера видят один и тот же файл:
+
+```bash
+pct exec 101 -- cat /root/.anki_vector/sdk_config.ini
+pct exec 112 -- cat /root/.anki_vector/sdk_config.ini   # должно совпасть
+```
+
+**Если guid всё же разошёлся к моменту, когда вы это настраиваете** (типичный
+случай — вы уже пытались чинить проблему копированием и в общий файл попала
+устаревшая версия) — источник истины не `/tmp/.anki_vector`, а собственная
+база wire-pod:
+
+```bash
+cat /etc/wire-pod/wire-pod/jdocs/botSdkInfo.json   # deb-версия; из исходников — wire-pod/jdocs/...
+```
+
+Возьмите `guid` оттуда для нужного `esn` и пропишите его в общий
+`sdk_config.ini` вручную (заодно можно перевыпустить сертификат — команда в
+начале раздела 3).
+
 ### 4. Демон: установка и настройка
 
 ```bash
@@ -267,6 +335,7 @@ cp trigger.sh /opt/vector-ru/ && chmod +x /opt/vector-ru/trigger.sh
 | В логе wire-pod `Executing: ... !speechText !botSerial` буквально | аргументы интента введены через пробел; нужно через запятую |
 | `ListAnimations request timed out` | предзагрузка списка анимаций; в актуальной версии отключена (ленивый кэш) |
 | Робот молчит, curl-тест работает | смотреть лог wire-pod: дошло ли до `Executing`, и лог демона: пришёл ли POST |
+| `StatusCode.UNAUTHENTICATED: 401 Failed to authenticate request` (особенно после ребута/отключения света) | guid в `~/.anki_vector/sdk_config.ini` на хосте демона устарел — wire-pod и демон разошлись. Разовая правка: см. «Если сертификат утерян» (раздел 3, guid — из `botSdkInfo.json`). Чтобы не повторялось: раздел 3.1 (общий bind-mount вместо копирования) |
 | Ответы медленные (20+ с) | LLM на CPU — см. раздел про GPU |
 | LLM «включила» свет, но нет | модель без инструментов галлюцинирует успех — см. раздел HA |
 | Vector-X1D1 не резолвится / таймауты подключения | сменился IP робота — обновить `ip` в sdk_config.ini, закрепить IP в DHCP |
