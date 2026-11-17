@@ -70,6 +70,21 @@ TTS_ENGINE     = os.environ.get("TTS_ENGINE", "silero")       # silero | xtts
 SILERO_SPEAKER = os.environ.get("SILERO_SPEAKER", "xenia")    # aidar|baya|kseniya|xenia|eugene
 XTTS_SPEAKER_WAV = os.environ.get("XTTS_SPEAKER_WAV", "")     # путь к образцу голоса 6-15 c (для xtts)
 
+# --- Wyoming TTS для Home Assistant ---------------------------------------
+# Современная замена legacy-интеграции marytts: HA получает полноценную
+# TTS-сущность с выбором голоса. Работает только с TTS_ENGINE=silero.
+# Голос робота (SILERO_SPEAKER + питч-шифт) этим не затрагивается — это
+# отдельная дорожка, см. synthesize().
+WYOMING_ENABLE = os.environ.get("WYOMING_ENABLE", "true").lower() in ("1", "true", "yes")
+WYOMING_PORT   = int(os.environ.get("WYOMING_PORT", "10200"))
+WYOMING_RATE   = int(os.environ.get("WYOMING_RATE", "48000"))  # 8000|24000|48000
+SILERO_VOICES  = ["aidar", "baya", "kseniya", "xenia", "eugene"]
+# Высота и скорость озвучки ДЛЯ HA (робота не касается — у него свои
+# VOICE_PITCH/VOICE_TEMPO). В протоколе Wyoming полей для этого нет, поэтому
+# параметры серверные: общие для всей озвучки HA.
+HA_TTS_PITCH   = float(os.environ.get("HA_TTS_PITCH", "1.0"))
+HA_TTS_TEMPO   = float(os.environ.get("HA_TTS_TEMPO", "1.0"))
+
 # --- Постобработка голоса "под Вектора" -----------------------------------
 # VOICE_PITCH: множитель высоты тона. 1.0 = без изменений.
 #   Сдвигаются и форманты (эффект "маленького робота", как у оригинала).
@@ -400,28 +415,67 @@ def _save_tensor_as_wav(audio_tensor: torch.Tensor, sample_rate: int, path: str)
         wf.writeframes(pcm.tobytes())
 
 
+def _pcm_fx(pcm: bytes, rate: int, pitch: float, tempo: float) -> bytes:
+    """Высота/скорость для озвучки HA. Тот же приём, что в synthesize() для
+    робота (сдвиг тона вместе с формантами), но через пайп ffmpeg — здесь
+    незачем заводить временные файлы."""
+    filters = []
+    if abs(pitch - 1.0) > 0.01:
+        filters.append(f"asetrate={int(rate * pitch)}")
+        filters.append(f"aresample={rate}")
+        filters.append(f"atempo={1.0 / pitch:.4f}")
+    if abs(tempo - 1.0) > 0.01:
+        filters.append(f"atempo={tempo:.4f}")
+    if not filters:
+        return pcm
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
+           "-af", ",".join(filters), "-f", "s16le", "pipe:1"]
+    try:
+        return subprocess.run(cmd, input=pcm, stdout=subprocess.PIPE,
+                              check=True).stdout
+    except Exception:
+        log.exception("Постобработка звука не удалась, отдаю как есть")
+        return pcm
+
+
+def _silero_pcm_for_ha(text: str, rate: int, speaker: str) -> bytes:
+    """Синтез + постобработка для HA, одним блокирующим вызовом (удобно
+    отдавать в executor из Wyoming-сервера)."""
+    audio = _silero_synth(text, rate, speaker=speaker)
+    pcm = (audio.numpy() * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+    return _pcm_fx(pcm, rate, HA_TTS_PITCH, HA_TTS_TEMPO)
+
+
+_tts_lock = threading.Lock()  # silero не потокобезопасен
+
+def _silero_synth(text: str, sample_rate: int, speaker: str = None) -> torch.Tensor:
+    """Синтез Silero с разбиением длинного текста на куски (<~800 символов)."""
+    speaker = speaker or SILERO_SPEAKER
+    chunks, buf = [], ""
+    for sent in re.split(r"(?<=[.!?])\s+", text):
+        if len(buf) + len(sent) > 800:
+            chunks.append(buf); buf = sent
+        else:
+            buf = (buf + " " + sent).strip()
+    if buf:
+        chunks.append(buf)
+    parts = []
+    with _tts_lock:
+        for ch in chunks:
+            if ch.strip():
+                parts.append(silero_model.apply_tts(
+                    text=ch, speaker=speaker, sample_rate=sample_rate))
+    if not parts:
+        raise ValueError("Пустой текст для синтеза")
+    return torch.cat(parts)
+
+
 def synthesize(text: str, out_path: str):
     """Синтезирует text и кладёт готовый для робота WAV в out_path."""
     raw_path = out_path + ".raw.wav"
     if TTS_ENGINE == "silero":
-        # Silero: лимит ~1000 символов на вызов — режем по предложениям
-        chunks, buf = [], ""
-        for sent in re.split(r"(?<=[.!?])\s+", text):
-            if len(buf) + len(sent) > 800:
-                chunks.append(buf); buf = sent
-            else:
-                buf = (buf + " " + sent).strip()
-        if buf:
-            chunks.append(buf)
-        parts = []
-        for ch in chunks:
-            if not ch.strip():
-                continue
-            parts.append(silero_model.apply_tts(
-                text=ch, speaker=SILERO_SPEAKER, sample_rate=24000))
-        if not parts:
-            raise ValueError("Пустой текст для синтеза")
-        _save_tensor_as_wav(torch.cat(parts), 24000, raw_path)
+        _save_tensor_as_wav(_silero_synth(text, 24000), 24000, raw_path)
     else:  # xtts
         kwargs = {"text": text, "language": "ru", "file_path": raw_path}
         if XTTS_SPEAKER_WAV:
@@ -706,9 +760,206 @@ def ask():
     return "ok", 200
 
 
+@app.route("/process", methods=["GET", "POST"])
+def marytts_process():
+    """MaryTTS-совместимый endpoint: позволяет использовать этот демон как
+    TTS-сервер Home Assistant (штатная интеграция marytts).
+
+    configuration.yaml:
+      tts:
+        - platform: marytts
+          host: <IP этого сервера>
+          port: 8090
+          codec: WAVE_FILE
+          voice: xenia          # aidar|baya|kseniya|xenia|eugene
+          language: ru
+    """
+    text = request.values.get("INPUT_TEXT", "").strip()
+    voice = request.values.get("VOICE", "").strip() or None
+    if not text and request.get_data():
+        # Библиотека speak2mary (интеграция marytts в HA) шлёт POST-форму
+        # БЕЗ заголовка Content-Type — Flask её не парсит, разбираем сами.
+        from urllib.parse import parse_qs
+        q = parse_qs(request.get_data(as_text=True))
+        text = q.get("INPUT_TEXT", [""])[0].strip()
+        voice = (q.get("VOICE", [""])[0].strip() or None) if not voice else voice
+    # Тег эмоции ([радость] и т.п.) нужен только роботу — вслух его не читаем
+    _, text = extract_emotion(text)
+    if not text:
+        return "INPUT_TEXT is required", 400
+    if TTS_ENGINE != "silero":
+        return "MaryTTS endpoint поддерживает только TTS_ENGINE=silero", 501
+    try:
+        pcm = _silero_pcm_for_ha(normalize_for_tts(text), 48000,
+                                 voice or SILERO_SPEAKER)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(48000)
+            wf.writeframes(pcm)
+        return app.response_class(buf.getvalue(), mimetype="audio/wav")
+    except Exception as e:
+        log.exception("MaryTTS endpoint")
+        return f"TTS error: {e}", 500
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return f"ok, engine={TTS_ENGINE}", 200
+
+
+# --------------------------------------------------------------------------
+# Wyoming TTS server (протокол Rhasspy/Home Assistant)
+#
+# Фрейминг: строка-заголовок JSON, затем (если указаны) data_length байт JSON
+# с данными события и payload_length байт бинарного хвоста. Данные ВНУТРИ
+# заголовка — лишь запасной вариант, сама HA шлёт их отдельным блоком.
+# Нам нужны: describe (отдаём info со списком голосов), synthesize (синтез)
+# и ответная тройка audio-start / audio-chunk / audio-stop с сырым PCM.
+# Поэтому пакет wyoming в зависимости не тащим — тут около сотни строк.
+# --------------------------------------------------------------------------
+_WYOMING_CHUNK = 8192   # байт PCM на одно событие audio-chunk
+_SILERO_ATTRIBUTION = {"name": "snakers4/silero-models",
+                       "url": "https://github.com/snakers4/silero-models"}
+
+
+def _wyoming_info() -> dict:
+    return {"tts": [{
+        "name": "silero",
+        "description": "Silero TTS v4 (ru)",
+        "attribution": _SILERO_ATTRIBUTION,
+        "installed": True,
+        "version": "v4_ru",
+        "supports_synthesize_streaming": False,
+        "voices": [{
+            "name": voice,
+            "description": f"Silero v4 ru: {voice}",
+            "attribution": _SILERO_ATTRIBUTION,
+            "installed": True,
+            "version": None,
+            # оба тега: HA может просить озвучку и как "ru", и как "ru-RU",
+            # а неподдержанный язык она отбрасывает у себя, даже не подключаясь
+            "languages": ["ru", "ru-RU"],
+            "speakers": None,
+        } for voice in SILERO_VOICES],
+    }]}
+
+
+async def _wyoming_write(writer, event_type: str, data=None, payload: bytes = b""):
+    header = {"type": event_type}
+    data_bytes = b""
+    if data is not None:
+        data_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        header["data_length"] = len(data_bytes)
+    if payload:
+        header["payload_length"] = len(payload)
+    writer.write((json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8"))
+    if data_bytes:
+        writer.write(data_bytes)
+    if payload:
+        writer.write(payload)
+    await writer.drain()
+
+
+async def _wyoming_read(reader):
+    """Читает одно событие -> (тип, данные) или (None, None) при закрытии."""
+    line = await reader.readline()
+    if not line:
+        return None, None
+    try:
+        header = json.loads(line)
+    except json.JSONDecodeError:
+        return "", {}
+    data_length = header.get("data_length") or 0
+    if data_length:
+        data = json.loads(await reader.readexactly(data_length))
+    else:
+        data = header.get("data") or {}
+    payload_length = header.get("payload_length") or 0
+    if payload_length:
+        await reader.readexactly(payload_length)   # payload нам не нужен
+    return header.get("type"), data
+
+
+def _wyoming_voice(data: dict) -> str:
+    voice = (data.get("voice") or {}).get("name") or SILERO_SPEAKER
+    if voice not in SILERO_VOICES:
+        log.warning("Wyoming: неизвестный голос '%s', беру %s", voice, SILERO_SPEAKER)
+        voice = SILERO_SPEAKER
+    return voice
+
+
+async def _wyoming_synthesize(writer, text: str, voice: str):
+    text = (text or "").strip()
+    # Тег эмоции нужен только роботу — колонкам его вслух не читаем
+    _, text = extract_emotion(text)
+
+    pcm = b""
+    if text:
+        log.info("Wyoming: синтез голосом %s: %s", voice, text[:80])
+        try:
+            pcm = await asyncio.get_running_loop().run_in_executor(
+                None, _silero_pcm_for_ha, normalize_for_tts(text),
+                WYOMING_RATE, voice)
+        except Exception:
+            log.exception("Wyoming: синтез не удался")
+
+    # Даже при ошибке отвечаем пустой парой start/stop, иначе HA ждёт таймаут
+    fmt = {"rate": WYOMING_RATE, "width": 2, "channels": 1}
+    await _wyoming_write(writer, "audio-start", {**fmt, "timestamp": 0})
+    for i in range(0, len(pcm), _WYOMING_CHUNK):
+        await _wyoming_write(writer, "audio-chunk", fmt, pcm[i:i + _WYOMING_CHUNK])
+    await _wyoming_write(writer, "audio-stop",
+                         {"timestamp": int(len(pcm) / 2 / WYOMING_RATE * 1000)})
+
+
+async def _wyoming_client(reader, writer):
+    peer = writer.get_extra_info("peername")
+    # Состояние потокового синтеза: HA (свежие версии) вместо одиночного
+    # synthesize шлёт synthesize-start -> synthesize-chunk... -> synthesize-stop
+    stream_voice, stream_text = SILERO_SPEAKER, []
+    try:
+        while True:
+            etype, data = await _wyoming_read(reader)
+            if etype is None:
+                break
+            log.info("Wyoming: событие %s", etype)
+            if etype == "describe":
+                await _wyoming_write(writer, "info", _wyoming_info())
+            elif etype == "synthesize":
+                await _wyoming_synthesize(writer, data.get("text"),
+                                          _wyoming_voice(data))
+            elif etype == "synthesize-start":
+                stream_voice, stream_text = _wyoming_voice(data), []
+            elif etype == "synthesize-chunk":
+                stream_text.append(data.get("text") or "")
+            elif etype == "synthesize-stop":
+                await _wyoming_synthesize(writer, "".join(stream_text), stream_voice)
+                stream_text = []
+            elif etype == "ping":
+                await _wyoming_write(writer, "pong", data)
+    except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+        pass
+    except Exception:
+        log.exception("Wyoming: ошибка в сессии %s", peer)
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+def start_wyoming_server():
+    """Поднимает Wyoming-сервер в отдельном потоке (Flask живёт в основном)."""
+    async def _serve():
+        server = await asyncio.start_server(_wyoming_client, "0.0.0.0", WYOMING_PORT)
+        log.info("Wyoming TTS на порту %d, голоса: %s",
+                 WYOMING_PORT, ", ".join(SILERO_VOICES))
+        async with server:
+            await server.serve_forever()
+
+    threading.Thread(target=lambda: asyncio.run(_serve()), daemon=True).start()
 
 
 if __name__ == "__main__":
@@ -716,4 +967,6 @@ if __name__ == "__main__":
         raise SystemExit("ffmpeg не найден — apt install ffmpeg")
     log.info("Демон запущен на порту %d, TTS=%s, LLM=%s (%s)",
              LISTEN_PORT, TTS_ENGINE, LLM_URL, LLM_MODEL)
+    if WYOMING_ENABLE and TTS_ENGINE == "silero":
+        start_wyoming_server()
     app.run(host="0.0.0.0", port=LISTEN_PORT, threaded=True)
